@@ -75,12 +75,15 @@ class Config:
 EVAL_HEADERS = ["値(比較用)", "値(比較用） 加工", "取得値", "自動", "手動", 
                 "判定理由", "担当者", "自/他", "手動", "判定理由"]
 
+# Mode 1 only: if U is maru (manual), Y is auto maru
+
 # Excel formulas
 FORMULA_SHOURYAKU = '=IF(AND(M13="", O13="", N13<>""), "○", "")'
 FORMULA_VALUE_COMPARE = '=IF(P13="","",IF(P13="←",IF(OFFSET($J13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)="","",OFFSET($L13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)),P13))'
 FORMULA_VALUE_PROCESS = '=IF(COUNTIF(Q13,"*(*"),MID(Q13,FIND("(",Q13,1)+1,FIND(")",Q13,1)-FIND("(",Q13,1)-1),IF(COUNTIF(Q13,"*""*"),MID(Q13,FIND("""",Q13,1)+1,LEN(Q13)-2),IF(COUNTIF(Q13,"*：*"),RIGHT(Q13,LEN(Q13)-(FIND("：",Q13))),Q13)))'
-FORMULA_VLOOKUP = '=IFERROR(IF(VLOOKUP("*"&TRIM($F13)&"*",dump!$A:$D,4,FALSE)="","空文字",VLOOKUP("*"&TRIM($F13)&"*",dump!$A:$D,4,FALSE)),"NA")'
+FORMULA_VLOOKUP = '=IFERROR(IF(VLOOKUP("*"&TRIM($F13)&"*",dump!$A:$D,4,FALSE)="","空文字",VLOOKUP("*"&TRIM($F13)&"*",dump!$A:$D,4,FALSE)),IF(RIGHT(TRIM($F13),2)=".x",IFERROR(IF(VLOOKUP("*"&LEFT(TRIM($F13),LEN(TRIM($F13))-1)&"1*",dump!$A:$D,4,FALSE)="","空文字",VLOOKUP("*"&LEFT(TRIM($F13),LEN(TRIM($F13))-1)&"1*",dump!$A:$D,4,FALSE)),"NA"),"NA"))'
 FORMULA_HANTEI = '=IF($K13<>"",IF($E13<>"","■",""),IF(AND(R13="",S13="NA"),"●", IF(EXACT(R13,S13),"●","×")))'
+FORMULA_AUTO_MARU_Y_R1C1 = '=IF(RC[-4]="●","●","")'
 
 # ==========================================
 # UTILITY FUNCTIONS
@@ -170,17 +173,47 @@ def detect_sheet_names(checksheet_filename):
 def init_excel_app():
     """Initialize Excel application in background mode."""
     pythoncom.CoInitialize()
-    try:
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
-        excel.Visible = False  # Set immediately
-    except:
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False  # Set immediately
+    excel = create_excel_app()
     
     excel.DisplayAlerts = False
     excel.ScreenUpdating = False
     excel.EnableEvents = False
     return excel
+
+def create_excel_app():
+    """Create Excel COM app without relying on EnsureDispatch (gen_py can be corrupt)."""
+    try:
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        return excel
+    except Exception:
+        pass
+
+    try:
+        excel = win32.Dispatch("Excel.Application")
+        excel.Visible = False
+        return excel
+    except Exception as first_error:
+        # Last resort: clear generated COM cache and retry.
+        try:
+            import win32com
+            gen_path = getattr(win32com, "__gen_path__", "")
+            if gen_path and os.path.isdir(gen_path):
+                shutil.rmtree(gen_path, ignore_errors=True)
+
+            try:
+                win32.gencache.is_readonly = False
+                win32.gencache.Rebuild()
+            except Exception:
+                pass
+
+            excel = win32.Dispatch("Excel.Application")
+            excel.Visible = False
+            return excel
+        except Exception as final_error:
+            raise RuntimeError(
+                f"Failed to initialize Excel COM. First error: {first_error}; after cache reset: {final_error}"
+            )
 
 def close_excel_safely(excel, wb=None):
     """Close Excel application and cleanup COM."""
@@ -335,6 +368,7 @@ def add_evaluation_columns(sheet, last_row, excel_app):
         if last_row >= Config.ROW_DATA_START:
             _apply_evaluation_formulas(sheet, last_row)
             _clear_nw_rows(sheet, last_row)
+            _apply_auto_maru_rule_mode1(sheet, last_row)
     finally:
         excel_app.Calculation = original_calc
 
@@ -361,19 +395,37 @@ def _apply_evaluation_formulas(sheet, last_row):
         area.Formula = formula
 
 def _clear_nw_rows(sheet, last_row):
-    """Clear evaluation columns for NW rows."""
+    """Clear Q:Z when row is NW, B/C/D contain values, or F is only a numeric index."""
     data_j = sheet.Range(
         sheet.Cells(Config.ROW_DATA_START, 10),
         sheet.Cells(last_row, 10)
     ).Value
+    data_b_to_d = sheet.Range(
+        sheet.Cells(Config.ROW_DATA_START, 2),
+        sheet.Cells(last_row, 4)
+    ).Value
+    data_f = sheet.Range(
+        sheet.Cells(Config.ROW_DATA_START, 6),
+        sheet.Cells(last_row, 6)
+    ).Value
     
-    if not data_j:
+    if not data_j and not data_b_to_d and not data_f:
         return
     
     ranges_to_clear = []
-    for i, row_data in enumerate(data_j):
-        value = str(row_data[0]) if row_data[0] else ""
-        if "NW" in value:
+    total_rows = last_row - Config.ROW_DATA_START + 1
+    for i in range(total_rows):
+        row_j = data_j[i] if data_j and i < len(data_j) else None
+        value_j = str(row_j[0]) if row_j and row_j[0] else ""
+
+        row_bcd = data_b_to_d[i] if data_b_to_d and i < len(data_b_to_d) else None
+        has_value_bcd = any(cell not in (None, "") for cell in row_bcd) if row_bcd else False
+
+        row_f = data_f[i] if data_f and i < len(data_f) else None
+        value_f = str(row_f[0]).strip() if row_f and row_f[0] is not None else ""
+        is_numeric_only_oid = bool(re.fullmatch(r'\d+', value_f))
+
+        if "NW" in value_j or has_value_bcd or is_numeric_only_oid:
             row_num = Config.ROW_DATA_START + i
             ranges_to_clear.append(f"Q{row_num}:Z{row_num}")
     
@@ -390,6 +442,17 @@ def _clear_nw_rows(sheet, last_row):
                 combined.ClearContents()
             except:
                 pass
+
+def _apply_auto_maru_rule_mode1(sheet, last_row):
+    """Mode 1 only: auto-fill Y from manual maru in U for all data rows."""
+    if last_row < Config.ROW_DATA_START:
+        return
+
+    target_range = sheet.Range(
+        sheet.Cells(Config.ROW_DATA_START, 25),
+        sheet.Cells(last_row, 25)
+    )
+    target_range.FormulaR1C1 = FORMULA_AUTO_MARU_Y_R1C1  # Column Y based on U
 
 def delete_unused_sheets(wb):
     """Delete sheets not in important list."""
@@ -506,13 +569,7 @@ def process_sheet_cutting(wb, target_col, excel):
 def detect_models_from_spek(file_spek, checksheet_filename=""):
     """Detect available models from Spek file."""
     pythoncom.CoInitialize()
-    
-    try:
-        excel = win32.gencache.EnsureDispatch("Excel.Application")
-        excel.Visible = False  # Set immediately
-    except:
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False  # Set immediately
+    excel = create_excel_app()
     
     excel.DisplayAlerts = False
     excel.ScreenUpdating = False
@@ -623,6 +680,15 @@ def background_worker_mode1(spek_path, selected, template_path, output_queue):
         delete_unused_sheets(wb)
         
         output_queue.put({"progress": 90, "message": "💾 Saving..."})
+        # Ensure formulas stay responsive after user edits in Excel (U -> Y).
+        excel.Calculation = ExcelConst.CALCULATION_AUTOMATIC
+        try:
+            excel.CalculateFullRebuild()
+        except:
+            try:
+                excel.Calculate()
+            except:
+                pass
         wb.Save()
         wb.Close(SaveChanges=False)
         close_excel_safely(excel)
@@ -683,13 +749,7 @@ def background_worker_mode2(spek_path, checksheet_path, selected_model, output_q
         output_queue.put({"progress": 10, "message": f"🔌 Initializing Excel... (Using {mib_sheet_name})"})
         
         pythoncom.CoInitialize()
-        
-        try:
-            excel = win32.gencache.EnsureDispatch("Excel.Application")
-            excel.Visible = False  # Set immediately to prevent flash
-        except:
-            excel = win32.Dispatch("Excel.Application")
-            excel.Visible = False  # Set immediately to prevent flash
+        excel = create_excel_app()
         
         excel.DisplayAlerts = False
         excel.ScreenUpdating = False
@@ -1084,8 +1144,8 @@ def main():
         mode = st.radio(
             "Pilih Menu:",
             [
-                "📊 Mode 1: MIB Checksheet Overall",
-                "🎯 Mode 2: MIB Checksheet Section"
+                "📊 MIB Checksheet Overall",
+                "🎯 MIB Checksheet Section"
             ],
             index=0
         )
@@ -1093,7 +1153,7 @@ def main():
         st.divider()
         st.markdown("### ℹ️ Info")
         
-        if "Mode 1" in mode:
+        if "Overall" in mode:
             st.info("""
             **MIB Checksheet Overall**
             - Generate checksheet per Model
@@ -1110,7 +1170,7 @@ def main():
             - Background processing
             """)
     
-    if "Mode 1" in mode:
+    if "Overall" in mode:
         st.markdown("## 📊 MIB Checksheet Overall")
         st.caption("Generate checksheet dari MIB Implementation Specification dengan memilih model tertentu")
         st.divider()
@@ -1297,7 +1357,7 @@ def run_mode_model():
                     st.session_state.models_detected = models
                     st.session_state.spek_path = spek_path
                     st.session_state.checksheet_path = checksheet_path
-                    st.success(f"✅ Detected {len(models)} models: {[m['name'] for m in models]}")
+                    st.success(f"✅ Detected {len(models)} models")
                 else:
                     st.error("❌ No models detected")
                     return
