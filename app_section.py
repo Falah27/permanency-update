@@ -1,4 +1,5 @@
 import win32com.client as win32
+import pythoncom
 import os
 import time
 from datetime import datetime
@@ -13,6 +14,9 @@ def detect_models_from_spek(file_spek):
     Returns: list of dict [{"name": "CL86", "col_index": 11}, ...]
     """
     print("\n🔍 Mendeteksi model yang tersedia di file Spek...")
+    
+    # Initialize COM for this thread
+    pythoncom.CoInitialize()
     
     try:
         excel = win32.gencache.EnsureDispatch("Excel.Application")
@@ -54,7 +58,11 @@ def detect_models_from_spek(file_spek):
     except Exception as e:
         print(f"   ❌ Error saat deteksi model: {e}")
     finally:
-        excel.Quit()
+        try:
+            excel.Quit()
+        except:
+            pass
+        pythoncom.CoUninitialize()  # Cleanup COM
     
     return models
 
@@ -69,6 +77,9 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
     print(f"📅 Waktu Mulai: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"🎯 Model Terpilih: {selected_model_name}")
     print("="*70)
+    
+    # Initialize COM for this thread (required for Streamlit/multi-threading)
+    pythoncom.CoInitialize()
     
     try:
         excel = win32.gencache.EnsureDispatch("Excel.Application")
@@ -95,37 +106,55 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
         
         # Cari kolom model yang dipilih di Private MIB
         model_col_private = None
+        model_col_value = None  # Kolom nilai actual (kolom +4 dari header, yaitu kolom '値')
         for col_idx in range(11, 200, 5):
             header_value = ws_private.Cells(11, col_idx).Value
             if header_value and str(header_value).strip() == selected_model_name:
                 model_col_private = col_idx
+                model_col_value = col_idx + 4  # Ambil dari kolom ke-5 (offset +4), yaitu kolom '値'
                 print(f"   ✓ Model '{selected_model_name}' ditemukan di Private MIB kolom {col_idx}")
+                print(f"   ✓ Nilai akan diambil dari kolom {model_col_value} (kolom '値' dengan nilai actual)")
                 break
         
         if not model_col_private:
             print(f"   ⚠️ Model '{selected_model_name}' tidak ditemukan di Private MIB")
         
-        # Baca OID dan nilai dari Private MIB untuk mapping
+        # Baca OID, Attribute Name, dan nilai dari Private MIB untuk mapping
         last_row_private = ws_private.Cells(ws_private.Rows.Count, 6).End(-4162).Row
-        private_oid_value_map = {}  # Map OID ke nilai model (● atau -)
+        private_oid_value_map = {}  # Map OID ke nilai model
+        private_attr_value_map = {}  # Map Attribute Name ke nilai model
+        mib_oid_to_attr_map = {}  # Map OID ke Attribute Name (untuk validasi)
         
-        if model_col_private and last_row_private >= 12:
-            # Baca OID (kolom F/6) dan nilai model sekaligus
+        if model_col_value and last_row_private >= 12:
+            # Baca OID (kolom F/6), Attribute Name (kolom E/5), dan nilai model (kolom O) sekaligus
             oid_range = ws_private.Range(ws_private.Cells(12, 6), ws_private.Cells(last_row_private, 6)).Value
-            value_range = ws_private.Range(ws_private.Cells(12, model_col_private), ws_private.Cells(last_row_private, model_col_private)).Value
+            attr_range = ws_private.Range(ws_private.Cells(12, 5), ws_private.Cells(last_row_private, 5)).Value
+            value_range = ws_private.Range(ws_private.Cells(12, model_col_value), ws_private.Cells(last_row_private, model_col_value)).Value
             
-            if oid_range and value_range:
+            if oid_range and attr_range and value_range:
                 for i in range(len(oid_range)):
                     oid_row = oid_range[i]
+                    attr_row = attr_range[i]
                     value_row = value_range[i]
                     
                     oid = oid_row[0] if oid_row and oid_row[0] else None
+                    attr_name = attr_row[0] if attr_row and attr_row[0] else None
                     value = value_row[0] if value_row and value_row[0] else None
                     
                     if oid:
+                        # Map OID ke nilai
                         private_oid_value_map[str(oid).strip()] = value if value else ""
+                        
+                        # Map OID ke Attribute Name (untuk double validation)
+                        if attr_name:
+                            mib_oid_to_attr_map[str(oid).strip()] = str(attr_name).strip().lower()
+                    
+                    if attr_name:
+                        # Map Attribute Name ke nilai (untuk fallback matching)
+                        attr_key = str(attr_name).strip().lower()  # Case-insensitive
+                        private_attr_value_map[attr_key] = value if value else ""
             
-            print(f"   ✓ Berhasil mapping {len(private_oid_value_map)} OID dari Private MIB ({time.time()-step_start:.2f}s)")
+            print(f"   ✓ Berhasil mapping {len(private_oid_value_map)} OID dan {len(private_attr_value_map)} Attribute dari Private MIB ({time.time()-step_start:.2f}s)")
         
         # ===== LANGKAH 2: BACA FILE MIB (PRIVATE) UNTUK MATCHING =====
         print("\n📖 [2/6] Membaca OID dari MIB Private untuk matching...")
@@ -181,17 +210,33 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
             print(f"   ✓ Cleared range I{start_row}:V{last_row_check}")
         
         # ===== LANGKAH 5: PROSES MATCHING OID (OPTIMASI BESAR!) =====
-        print("\n⚙️  [5/6] Memproses matching OID dan menyiapkan data...")
+        print("\n⚙️  [5/6] Memproses matching OID dan Attribute Name...")
         step_start = time.time()
         
-        # OPTIMASI: Baca semua OID checksheet sekaligus
+        # OPTIMASI: Baca semua data dari checksheet sekaligus
         if last_row_check >= start_row:
+            # Baca kolom D (Attribute), kolom E (範囲外), dan kolom F (OID)
+            check_attr_range = ws_check.Range(ws_check.Cells(start_row, 4), ws_check.Cells(last_row_check, 4)).Value
+            check_col_e_range = ws_check.Range(ws_check.Cells(start_row, 5), ws_check.Cells(last_row_check, 5)).Value
             check_oid_range = ws_check.Range(ws_check.Cells(start_row, 6), ws_check.Cells(last_row_check, 6)).Value
+            
+            if check_attr_range is None:
+                check_attr_range = []
+            elif not isinstance(check_attr_range[0], tuple):
+                check_attr_range = [(check_attr_range,)]
+            
+            if check_col_e_range is None:
+                check_col_e_range = []
+            elif not isinstance(check_col_e_range[0], tuple):
+                check_col_e_range = [(check_col_e_range,)]
+                
             if check_oid_range is None:
                 check_oid_range = []
             elif not isinstance(check_oid_range[0], tuple):
                 check_oid_range = [(check_oid_range,)]
         else:
+            check_attr_range = []
+            check_col_e_range = []
             check_oid_range = []
         
         # OPTIMASI: Siapkan data output dalam memory (tidak tulis satu-satu ke Excel)
@@ -200,11 +245,28 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
         output_data_rest = []   # Kolom K-V: data lainnya
         match_count = 0
         no_support_count = 0
+        match_by_oid_exact_count = 0  # OID exact match (tanpa peduli attribute)
+        match_by_oid_parent_count = 0  # OID parent match (tanpa peduli attribute)
+        match_by_attr_only_count = 0  # Match hanya by attribute (OID tidak match)
+        oid_match_attr_validated_count = 0  # OID match DAN attribute validated ✓
+        oid_rejected_count = 0  # OID match tapi attribute tidak match (false positive)
         
         found_values_count = 0  # Track berapa OID yang dapat nilai dari model
         
         for idx, row in enumerate(check_oid_range, start=1):
             c_oid_raw = row[0] if row else None
+            
+            # Baca attribute name dari kolom D
+            c_attr_name = ""
+            if idx <= len(check_attr_range):
+                attr_row = check_attr_range[idx - 1]
+                c_attr_name = str(attr_row[0]).strip().lower() if attr_row and attr_row[0] else ""
+            
+            # Baca nilai kolom E untuk cek 範囲外
+            col_e_value = ""
+            if idx <= len(check_col_e_range):
+                col_e_row = check_col_e_range[idx - 1]
+                col_e_value = str(col_e_row[0]).strip() if col_e_row and col_e_row[0] else ""
             
             if not c_oid_raw:
                 # Baris kosong, biarkan kosong juga
@@ -215,34 +277,106 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
             
             c_oid = str(c_oid_raw).strip()
             
-            # OPTIMASI: Cek matching dengan set (lebih cepat!)
-            is_match = False
-            if c_oid in mib_oids_set:
-                is_match = True
+            # Cek dulu apakah kolom E berisi "範囲外" -> langsung NoSupport
+            if "範囲外" in col_e_value:
+                is_match = False  # Paksa jadi NoSupport
+                match_method = None
+                matched_oid = None
             else:
-                # Cek apakah c_oid adalah child dari salah satu MIB OID
-                for m_oid in mib_oids_list:
-                    if c_oid.startswith(m_oid + "."):
+                # STRATEGI MATCHING dengan DOUBLE VALIDATION:
+                # 1. Coba match by OID (exact atau parent)
+                # 2. Validasi: OID match DAN Attribute Name juga harus match
+                # 3. Jika validasi gagal, coba match by Attribute Name saja
+                
+                is_match = False
+                match_method = None
+                matched_oid = None
+                
+                # MATCHING BY OID (dengan validasi attribute)
+                if c_oid in mib_oids_set:
+                    # OID exact match - validasi attribute name
+                    if c_oid in mib_oid_to_attr_map:
+                        mib_attr = mib_oid_to_attr_map[c_oid]
+                        if c_attr_name == mib_attr:
+                            is_match = True
+                            match_method = "oid_exact"
+                            matched_oid = c_oid
+                        else:
+                            oid_rejected_count += 1
+                    else:
+                        # OID match tapi tidak ada attribute di map, accept saja
                         is_match = True
-                        break
+                        match_method = "oid_exact"
+                        matched_oid = c_oid
+                else:
+                    # Cek apakah c_oid adalah child dari salah satu MIB OID (parent match)
+                    for m_oid in mib_oids_list:
+                        if c_oid.startswith(m_oid + "."):
+                            # Parent OID match - validasi attribute name
+                            if m_oid in mib_oid_to_attr_map:
+                                mib_attr = mib_oid_to_attr_map[m_oid]
+                                if c_attr_name == mib_attr:
+                                    is_match = True
+                                    match_method = "oid_parent"
+                                    matched_oid = m_oid
+                                    break
+                                else:
+                                    oid_rejected_count += 1
+                            else:
+                                # Parent match tapi tidak ada attribute, accept saja
+                                is_match = True
+                                match_method = "oid_parent"
+                                matched_oid = m_oid
+                                break
+                
+                # MATCHING BY ATTRIBUTE NAME (fallback jika OID tidak match atau ditolak)
+                if not is_match and c_attr_name and c_attr_name in private_attr_value_map:
+                    is_match = True
+                    match_method = "attribute"
             
             # Ambil nilai dari model yang dipilih (kolom J) - dari Private MIB
-            # Cari exact match dulu, kalau tidak ada cari parent OID
+            # Strategi: coba by OID dulu (exact atau parent), kalau gagal coba by Attribute Name
             model_value = ""
+            
+            # 1. Coba exact match by OID
             if c_oid in private_oid_value_map:
                 model_value = private_oid_value_map[c_oid]
                 found_values_count += 1
             else:
-                # Cari parent OID (OID checksheet mungkin lebih panjang)
+                # 2. Cari parent OID yang paling spesifik (longest match)
+                # Contoh: .28 akan cocok dengan .1 dan ambil nilai yang sama dari .1
+                best_parent = None
+                best_parent_value = None
                 for parent_oid, parent_value in private_oid_value_map.items():
                     if c_oid.startswith(parent_oid + "."):
-                        model_value = parent_value
+                        # Ambil parent yang paling panjang (paling spesifik)
+                        if best_parent is None or len(parent_oid) > len(best_parent):
+                            best_parent = parent_oid
+                            best_parent_value = parent_value
+                
+                if best_parent_value is not None:
+                    model_value = best_parent_value
+                    found_values_count += 1
+                else:
+                    # 3. Fallback: coba by Attribute Name
+                    if c_attr_name and c_attr_name in private_attr_value_map:
+                        model_value = private_attr_value_map[c_attr_name]
                         found_values_count += 1
-                        break
             
             # Siapkan data sesuai hasil matching
             if is_match:
                 match_count += 1
+                
+                # Track matching method dengan detail
+                if match_method == "attribute":
+                    match_by_attr_only_count += 1
+                elif match_method == "oid_exact":
+                    match_by_oid_exact_count += 1
+                    oid_match_attr_validated_count += 1  # Exact match pasti validated
+                elif match_method == "oid_parent":
+                    match_by_oid_parent_count += 1
+                    oid_match_attr_validated_count += 1  # Parent match yang lolos validasi
+                
                 # Kolom I: FactoryDefault
                 output_data_col_i.append("FactoryDefault")
                 # Kolom J: Nilai dari model
@@ -270,15 +404,15 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
                 output_data_col_j.append("")
                 # Kolom K-V
                 row_data = [
-                    "NA",         # Kolom K (11)
+                    "[NA]",       # Kolom K (11)
                     "",           # Kolom L (12)
                     "",           # Kolom M (13)
                     "-",          # Kolom N (14)
-                    "NA",         # Kolom O (15)
+                    "[NA]",       # Kolom O (15)
                     "",           # Kolom P (16)
                     "",           # Kolom Q (17)
                     "-",          # Kolom R (18)
-                    "NA",         # Kolom S (19)
+                    "[NA]",       # Kolom S (19)
                     "",           # Kolom T (20)
                     "",           # Kolom U (21)
                     "-"           # Kolom V (22)
@@ -291,7 +425,19 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
                 print(f"   ⏳ Progress: {idx}/{total_rows} baris ({idx*100//total_rows}%)")
         
         print(f"   ✓ Matching selesai: {match_count} match, {no_support_count} no-support ({time.time()-step_start:.2f}s)")
-        print(f"   ℹ️  OID dengan nilai model: {found_values_count}/{len(check_oid_range)}")
+        print(f"   ℹ️  Detail Matching:")
+        print(f"      - OID Exact Match        : {match_by_oid_exact_count}")
+        print(f"      - OID Parent Match       : {match_by_oid_parent_count}")
+        print(f"      - Attribute Only Match   : {match_by_attr_only_count}")
+        print(f"      - OID+Attr Validated ✓   : {oid_match_attr_validated_count}")
+        print(f"   ⚠️  OID rejected (attr ≠)   : {oid_rejected_count}")
+        print(f"   ℹ️  OID dengan nilai model   : {found_values_count}/{len(check_oid_range)}")
+        print(f"   ℹ️  Data siap ditulis: {len(output_data_col_i)} baris")
+        
+        # Debug: Tampilkan sampel data
+        if len(output_data_rest) > 0:
+            print(f"   ℹ️  Sampel data row pertama (kolom K-V): {output_data_rest[0]}")
+            print(f"   ℹ️  Jumlah kolom per row: {len(output_data_rest[0])}")
         
         # OPTIMASI: Tulis semua data sekaligus ke Excel (BULK WRITE!)
         print("\n💾 [6/6] Menulis hasil ke Checksheet...")
@@ -301,13 +447,37 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
             # Tulis kolom I (FactoryDefault/NoSupport)
             col_i_data = [[val] for val in output_data_col_i]
             ws_check.Range(ws_check.Cells(start_row, 9), ws_check.Cells(last_row_check, 9)).Value = col_i_data
+            print(f"   ✓ Kolom I tertulis: {len(col_i_data)} baris")
             
             # Tulis kolom J (Nilai dari model)
             col_j_data = [[val] for val in output_data_col_j]
             ws_check.Range(ws_check.Cells(start_row, 10), ws_check.Cells(last_row_check, 10)).Value = col_j_data
+            print(f"   ✓ Kolom J tertulis: {len(col_j_data)} baris")
             
             # Tulis kolom K sampai V (data evaluasi lainnya)
-            ws_check.Range(ws_check.Cells(start_row, 11), ws_check.Cells(last_row_check, 22)).Value = output_data_rest
+            # PERBAIKAN: Tulis kolom per kolom untuk memastikan berhasil
+            print(f"   ℹ️  Akan menulis {len(output_data_rest)} baris x 12 kolom (K-V)")
+            
+            try:
+                # Extract data per kolom dari output_data_rest
+                if len(output_data_rest) > 0:
+                    for col_offset in range(12):  # 12 kolom (K sampai V)
+                        col_data = [[row[col_offset]] for row in output_data_rest]
+                        col_index = 11 + col_offset  # K=11, L=12, ..., V=22
+                        ws_check.Range(ws_check.Cells(start_row, col_index), ws_check.Cells(last_row_check, col_index)).Value = col_data
+                    print(f"   ✓ Kolom K-V tertulis: {len(output_data_rest)} baris x 12 kolom")
+                else:
+                    print(f"   ⚠️  Tidak ada data untuk ditulis ke kolom K-V")
+            except Exception as e:
+                print(f"   ❌ Error menulis kolom K-V: {e}")
+                # Coba tulis satu per satu untuk debug
+                print(f"   ⚠️  Mencoba tulis satu per satu...")
+                for i, row_data in enumerate(output_data_rest):
+                    try:
+                        row_num = start_row + i
+                        ws_check.Range(ws_check.Cells(row_num, 11), ws_check.Cells(row_num, 22)).Value = [row_data]
+                    except Exception as e2:
+                        print(f"   ❌ Error di baris {row_num}: {e2}")
             
         print(f"   ✓ Data berhasil ditulis ke Excel ({time.time()-step_start:.2f}s)")
         
@@ -315,27 +485,33 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
         print("\n💾 Menyimpan file hasil...")
         step_start = time.time()
         file_name, file_ext = os.path.splitext(path_check)
-        new_path_check = f"{file_name}_aftergenerate{file_ext}"
+        new_path_check = f"{file_name}_{selected_model_name}_aftergenerate{file_ext}"
         
         if file_ext.lower() == '.xlsm':
             file_format = 52  # xlOpenXMLWorkbookMacroEnabled
         else:
             file_format = 51  # xlOpenXMLWorkbook (.xlsx)
-            
-        wb_check.SaveAs(new_path_check, FileFormat=file_format)
-        wb_check.Close(False)
+        
+        # PENTING: Pastikan data di-commit ke Excel sebelum save
+        excel.Calculate()  # Force calculation
+        excel.ScreenUpdating = False
+        
+        try:
+            wb_check.SaveAs(new_path_check, FileFormat=file_format)
+            wb_check.Close(False)
+            print(f"   ✓ File tersimpan: {os.path.basename(new_path_check)} ({time.time()-step_start:.2f}s)")
+        except Exception as e:
+            print(f"   ❌ Error saat save: {e}")
+            wb_check.Close(False)
         print(f"   ✓ File tersimpan ({time.time()-step_start:.2f}s)")
         
-        # ===== BUKA FILE HASIL =====
-        print("\n📂 Membuka file hasil di Excel...")
+        # ===== TUTUP EXCEL =====
+        print("\n🔒 Menutup Excel...")
         try:
-            # Buka file hasil agar user bisa langsung lihat
-            excel.Visible = True
-            excel.Workbooks.Open(os.path.abspath(new_path_check))
-            print(f"   ✓ File dibuka: {new_path_check}")
+            excel.Quit()
+            print(f"   ✓ Excel ditutup")
         except Exception as e:
-            print(f"   ⚠️ Tidak bisa auto-open: {e}")
-            print(f"   ℹ️  Silakan buka manual: {new_path_check}")
+            print(f"   ⚠️ Error saat tutup Excel: {e}")
         
         # ===== SELESAI =====
         total_time = time.time() - start_time
@@ -346,22 +522,30 @@ def generate_checksheet(file_mib, file_check, selected_model_name):
         print(f"   • Total OID di MIB      : {len(mib_oids_list)}")
         print(f"   • Total baris diproses  : {total_rows}")
         print(f"   • OID match (support)   : {match_count}")
+        print(f"     - OID Exact           : {match_by_oid_exact_count}")
+        print(f"     - OID Parent          : {match_by_oid_parent_count}")
+        print(f"     - Attribute Only      : {match_by_attr_only_count}")
+        print(f"     - OID+Attr Validated✓ : {oid_match_attr_validated_count}")
+        print(f"   • OID rejected (attr ≠) : {oid_rejected_count}")
         print(f"   • OID no-support        : {no_support_count}")
         print(f"   • Model dipilih         : {selected_model_name}")
         print(f"   • Waktu total           : {total_time:.2f} detik")
         print(f"   • File output           : {os.path.basename(new_path_check)}")
         print("="*70 + "\n")
         
+        return new_path_check  # Return path untuk Streamlit integration
+        
     except Exception as e:
         print(f"\n❌ TERJADI ERROR: {e}")
         import traceback
         traceback.print_exc()
-        
+        try:
+            excel.Quit()
+        except:
+            pass
+        raise  # Re-raise untuk error handling di Streamlit
     finally:
-        # Jangan quit Excel agar user bisa lihat hasilnya
-        # excel.EnableEvents = True 
-        # excel.Quit()
-        pass
+        pythoncom.CoUninitialize()  # Cleanup COM
 
 # ==========================================
 # MAIN EXECUTION

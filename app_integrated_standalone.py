@@ -9,7 +9,6 @@ MIB Checksheet Generator - Standalone Integrated Version
 import streamlit as st
 import win32com.client as win32
 import os
-import sys
 import warnings
 import pythoncom
 import time
@@ -75,15 +74,46 @@ class Config:
 EVAL_HEADERS = ["値(比較用)", "値(比較用） 加工", "取得値", "自動", "手動", 
                 "判定理由", "担当者", "自/他", "手動", "判定理由"]
 
-# Mode 1 only: if U is maru (manual), Y is auto maru
-
 # Excel formulas
 FORMULA_SHOURYAKU = '=IF(AND(M13="", O13="", N13<>""), "○", "")'
 FORMULA_VALUE_COMPARE = '=IF(P13="","",IF(P13="←",IF(OFFSET($J13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)="","",OFFSET($L13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)),P13))'
 FORMULA_VALUE_PROCESS = '=IF(COUNTIF(Q13,"*(*"),MID(Q13,FIND("(",Q13,1)+1,FIND(")",Q13,1)-FIND("(",Q13,1)-1),IF(COUNTIF(Q13,"*""*"),MID(Q13,FIND("""",Q13,1)+1,LEN(Q13)-2),IF(COUNTIF(Q13,"*：*"),RIGHT(Q13,LEN(Q13)-(FIND("：",Q13))),Q13)))'
 FORMULA_VLOOKUP = '=IFERROR(IF(VLOOKUP("*"&TRIM($F13)&"*",dump!$A:$D,4,FALSE)="","空文字",VLOOKUP("*"&TRIM($F13)&"*",dump!$A:$D,4,FALSE)),IF(RIGHT(TRIM($F13),2)=".x",IFERROR(IF(VLOOKUP("*"&LEFT(TRIM($F13),LEN(TRIM($F13))-1)&"1*",dump!$A:$D,4,FALSE)="","空文字",VLOOKUP("*"&LEFT(TRIM($F13),LEN(TRIM($F13))-1)&"1*",dump!$A:$D,4,FALSE)),"NA"),"NA"))'
 FORMULA_HANTEI = '=IF($K13<>"",IF($E13<>"","■",""),IF(AND(R13="",S13="NA"),"●", IF(EXACT(R13,S13),"●","×")))'
-FORMULA_AUTO_MARU_Y_R1C1 = '=IF(RC[-4]="●","●","")'
+
+def _load_auto_maru_oids_by_section():
+    """Load OID list per section from oids_auto_maru.txt.
+    Supported section examples: [PUBLIC_MIB], [EPSON_PRIVATE_MIB]."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    txt_path = os.path.join(base_dir, "oids_auto_maru.txt")
+    section_to_oids = {
+        "PUBLIC_MIB": set(),
+        "EPSON_PRIVATE_MIB": set(),
+    }
+    current_section = None
+
+    try:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if line.startswith("[") and line.endswith("]"):
+                    current_section = line[1:-1].strip().upper()
+                    if current_section not in section_to_oids:
+                        section_to_oids[current_section] = set()
+                    continue
+
+                if current_section:
+                    section_to_oids[current_section].add(line)
+    except FileNotFoundError:
+        pass
+
+    frozen = {k: frozenset(v) for k, v in section_to_oids.items()}
+    return frozen
+
+AUTO_MARU_OIDS_BY_SECTION = _load_auto_maru_oids_by_section()
 
 # ==========================================
 # UTILITY FUNCTIONS
@@ -218,7 +248,6 @@ def create_excel_app():
 def close_excel_safely(excel, wb=None):
     """Close Excel application and cleanup COM."""
     try:
-        workbook_count = excel.Workbooks.Count
         while excel.Workbooks.Count > 0:
             excel.Workbooks(1).Close(SaveChanges=False)
     except:
@@ -342,7 +371,7 @@ def add_evaluation_columns(sheet, last_row, excel_app):
     
     try:
         clear_area = sheet.Range(
-            sheet.Cells(1, start_col),
+            sheet.Cells(9, start_col),
             sheet.Cells(min(last_row + 10, 5000), start_col + 9)
         )
         clear_area.ClearFormats()
@@ -367,8 +396,20 @@ def add_evaluation_columns(sheet, last_row, excel_app):
         
         if last_row >= Config.ROW_DATA_START:
             _apply_evaluation_formulas(sheet, last_row)
-            _clear_nw_rows(sheet, last_row)
-            _apply_auto_maru_rule_mode1(sheet, last_row)
+
+            # Read col B(2)–J(10) in ONE COM call — shared by both functions below
+            # B=idx0, C=idx1, D=idx2, F=idx4, J=idx8
+            raw = sheet.Range(
+                sheet.Cells(Config.ROW_DATA_START, 2),
+                sheet.Cells(last_row, 10)
+            ).Value
+            if raw is None:
+                raw = []
+            elif not isinstance(raw, tuple) or (len(raw) > 0 and not isinstance(raw[0], tuple)):
+                raw = [(raw,)]
+
+            _clear_nw_rows(sheet, last_row, raw)
+            _apply_auto_maru_u_by_sheet_oid_list(sheet, last_row, raw)
     finally:
         excel_app.Calculation = original_calc
 
@@ -394,38 +435,28 @@ def _apply_evaluation_formulas(sheet, last_row):
         )
         area.Formula = formula
 
-def _clear_nw_rows(sheet, last_row):
-    """Clear Q:Z when row is NW, B/C/D contain values, or F is only a numeric index."""
-    data_j = sheet.Range(
-        sheet.Cells(Config.ROW_DATA_START, 10),
-        sheet.Cells(last_row, 10)
-    ).Value
-    data_b_to_d = sheet.Range(
-        sheet.Cells(Config.ROW_DATA_START, 2),
-        sheet.Cells(last_row, 4)
-    ).Value
-    data_f = sheet.Range(
-        sheet.Cells(Config.ROW_DATA_START, 6),
-        sheet.Cells(last_row, 6)
-    ).Value
-    
-    if not data_j and not data_b_to_d and not data_f:
+def _clear_nw_rows(sheet, last_row, data_b_to_j):
+    """Clear Q:Z when row is NW, B/C/D contain values, or F OID has no dot.
+    data_b_to_j: pre-read tuple-of-tuples for cols B(idx0)–J(idx8)."""
+    if not data_b_to_j:
         return
-    
+
     ranges_to_clear = []
     total_rows = last_row - Config.ROW_DATA_START + 1
     for i in range(total_rows):
-        row_j = data_j[i] if data_j and i < len(data_j) else None
-        value_j = str(row_j[0]) if row_j and row_j[0] else ""
+        row = data_b_to_j[i] if i < len(data_b_to_j) else None
+        if not row:
+            continue
 
-        row_bcd = data_b_to_d[i] if data_b_to_d and i < len(data_b_to_d) else None
-        has_value_bcd = any(cell not in (None, "") for cell in row_bcd) if row_bcd else False
+        # col J = index 8
+        value_j = str(row[8]) if row[8] is not None else ""
+        # col B-D = indices 0-2
+        has_value_bcd = any(row[k] not in (None, "") for k in range(3))
+        # col F = index 4
+        value_f = str(row[4]).strip() if row[4] is not None else ""
+        is_no_dot_oid = bool(value_f and "." not in value_f)
 
-        row_f = data_f[i] if data_f and i < len(data_f) else None
-        value_f = str(row_f[0]).strip() if row_f and row_f[0] is not None else ""
-        is_numeric_only_oid = bool(re.fullmatch(r'\d+', value_f))
-
-        if "NW" in value_j or has_value_bcd or is_numeric_only_oid:
+        if "NW" in value_j or has_value_bcd or is_no_dot_oid:
             row_num = Config.ROW_DATA_START + i
             ranges_to_clear.append(f"Q{row_num}:Z{row_num}")
     
@@ -443,16 +474,83 @@ def _clear_nw_rows(sheet, last_row):
             except:
                 pass
 
-def _apply_auto_maru_rule_mode1(sheet, last_row):
-    """Mode 1 only: auto-fill Y from manual maru in U for all data rows."""
-    if last_row < Config.ROW_DATA_START:
+def _apply_auto_maru_u_by_sheet_oid_list(sheet, last_row, data_b_to_j):
+    """Fill column U with ● for OIDs listed in oids_auto_maru.txt based on current sheet."""
+    if last_row < Config.ROW_DATA_START or not data_b_to_j:
         return
 
-    target_range = sheet.Range(
-        sheet.Cells(Config.ROW_DATA_START, 25),
-        sheet.Cells(last_row, 25)
-    )
-    target_range.FormulaR1C1 = FORMULA_AUTO_MARU_Y_R1C1  # Column Y based on U
+    sheet_name = str(sheet.Name).strip().lower()
+    if sheet_name == Config.SHEET_PUBLIC_MIB.lower():
+        target_oids = AUTO_MARU_OIDS_BY_SECTION.get("PUBLIC_MIB", frozenset())
+    elif sheet_name == Config.SHEET_PRIVATE_MIB.lower():
+        target_oids = AUTO_MARU_OIDS_BY_SECTION.get("EPSON_PRIVATE_MIB", frozenset())
+    else:
+        target_oids = frozenset()
+
+    total_rows = last_row - Config.ROW_DATA_START + 1
+    rows_for_u = []
+
+    for i in range(total_rows):
+        row = data_b_to_j[i] if i < len(data_b_to_j) else None
+        if not row:
+            continue
+
+        # col F = index 4 in B..J range
+        oid = str(row[4]).strip() if row[4] is not None else ""
+        if oid.endswith(".x"):
+            oid = oid[:-2]
+
+        if oid in target_oids:
+            rows_for_u.append(Config.ROW_DATA_START + i)
+
+    # Set value directly to ● in column U (21)
+    for batch_start in range(0, len(rows_for_u), Config.BATCH_SIZE_UNION):
+        batch = rows_for_u[batch_start:batch_start + Config.BATCH_SIZE_UNION]
+        if not batch:
+            continue
+        try:
+            if len(batch) == 1:
+                sheet.Cells(batch[0], 21).Value = "●"
+            else:
+                combined = sheet.Cells(batch[0], 21)
+                for row_num in batch[1:]:
+                    combined = sheet.Application.Union(combined, sheet.Cells(row_num, 21))
+                combined.Value = "●"
+        except:
+            pass
+
+    # Sync Y from U: every row where U is ●, set Y to ●
+    u_data = sheet.Range(
+        sheet.Cells(Config.ROW_DATA_START, 21),
+        sheet.Cells(last_row, 21)
+    ).Value
+
+    if u_data is None:
+        u_data = []
+    elif not isinstance(u_data, tuple) or (len(u_data) > 0 and not isinstance(u_data[0], tuple)):
+        u_data = [(u_data,)]
+
+    rows_for_y = []
+    for i in range(total_rows):
+        row_u = u_data[i] if i < len(u_data) else None
+        value_u = str(row_u[0]).strip() if row_u and row_u[0] is not None else ""
+        if value_u == "●":
+            rows_for_y.append(Config.ROW_DATA_START + i)
+
+    for batch_start in range(0, len(rows_for_y), Config.BATCH_SIZE_UNION):
+        batch = rows_for_y[batch_start:batch_start + Config.BATCH_SIZE_UNION]
+        if not batch:
+            continue
+        try:
+            if len(batch) == 1:
+                sheet.Cells(batch[0], 25).Value = "●"
+            else:
+                combined = sheet.Cells(batch[0], 25)
+                for row_num in batch[1:]:
+                    combined = sheet.Application.Union(combined, sheet.Cells(row_num, 25))
+                combined.Value = "●"
+        except:
+            pass
 
 def delete_unused_sheets(wb):
     """Delete sheets not in important list."""
@@ -827,16 +925,8 @@ def background_worker_mode2(spek_path, checksheet_path, selected_model, output_q
                         if value is not None and str(value).strip() != "":
                             private_attr_value_map[attr_key] = value
         
-        # Build OID sets
-        last_row_mib = ws_private.Cells(ws_private.Rows.Count, 6).End(-4162).Row
-        mib_oids_list = []
-        
-        if last_row_mib >= 12:
-            mib_range = ws_private.Range(ws_private.Cells(12, 6), ws_private.Cells(last_row_mib, 6)).Value
-            if mib_range:
-                mib_oids_list = [str(row[0]).strip() for row in mib_range if row[0] is not None]
-        
-        mib_oids_set = set(mib_oids_list)
+        # Build OID sets directly from already-read map (no second COM call needed)
+        mib_oids_set = set(private_oid_value_map.keys())
         
         wb_spek.Close(False)
         
@@ -972,33 +1062,15 @@ def background_worker_mode2(spek_path, checksheet_path, selected_model, output_q
                     if model_value and str(model_value).strip() != "":
                         value_from_exact_oid += 1
                 else:
-                    # Strategy 2: Find BEST (longest) parent OID match with progressive search
+                    # Strategy 2: Find BEST (longest) parent OID match
+                    # Go from longest prefix to shortest — first hit IS the best match
                     c_oid_parts = c_oid.split('.')
                     best_match_value = None
-                    best_match_len = 0
                     
-                    # Try progressively shorter prefixes to find best parent
-                    for length in range(len(c_oid_parts) - 1, 0, -1):
-                        parent_prefix = '.'.join(c_oid_parts[:length])
-                        
-                        # Check all MIB OIDs that could be parents
-                        for m_oid in private_oid_value_map.keys():
-                            # Check if checksheet OID starts with this MIB OID
-                            if c_oid.startswith(m_oid + ".") or c_oid == m_oid:
-                                m_oid_len = len(m_oid)
-                                if m_oid_len > best_match_len:
-                                    best_match_value = private_oid_value_map[m_oid]
-                                    best_match_len = m_oid_len
-                        
-                        # Also check exact prefix match
-                        if parent_prefix in private_oid_value_map:
-                            prefix_len = len(parent_prefix)
-                            if prefix_len > best_match_len:
-                                best_match_value = private_oid_value_map[parent_prefix]
-                                best_match_len = prefix_len
-                        
-                        # Stop if we found a match
-                        if best_match_value is not None:
+                    for length in range(len(c_oid_parts), 0, -1):
+                        prefix = '.'.join(c_oid_parts[:length])
+                        if prefix in private_oid_value_map:
+                            best_match_value = private_oid_value_map[prefix]
                             break
                     
                     if best_match_value is not None:
@@ -1042,7 +1114,7 @@ def background_worker_mode2(spek_path, checksheet_path, selected_model, output_q
         
         output_queue.put({"progress": 85, "message": "💾 Writing data..."})
         
-        # Write data to Excel
+        # Write data to Excel - single bulk write per column group
         if output_data_col_i and last_row_check >= start_row:
             col_i_data = [[val] for val in output_data_col_i]
             ws_check.Range(ws_check.Cells(start_row, 9), ws_check.Cells(last_row_check, 9)).Value = col_i_data
@@ -1347,7 +1419,9 @@ def run_mode_model():
     # Detect models
     st.markdown("### 🔍 Model Detection")
     
-    if "models_detected" not in st.session_state:
+    cache_key_mode2 = f"{uploaded_spek.name}_{uploaded_spek.size}_{uploaded_checksheet.name}"
+    
+    if "models_detected" not in st.session_state or st.session_state.get("mode2_cache_key") != cache_key_mode2:
         with st.spinner("🔍 Detecting available models..."):
             try:
                 checksheet_filename = os.path.basename(checksheet_path)
@@ -1357,6 +1431,7 @@ def run_mode_model():
                     st.session_state.models_detected = models
                     st.session_state.spek_path = spek_path
                     st.session_state.checksheet_path = checksheet_path
+                    st.session_state.mode2_cache_key = cache_key_mode2
                     st.success(f"✅ Detected {len(models)} models")
                 else:
                     st.error("❌ No models detected")
