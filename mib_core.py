@@ -78,7 +78,7 @@ EVAL_HEADERS = ["値(比較用)", "値(比較用） 加工", "取得値", "自�
 FORMULA_SHOURYAKU = '=IF(AND(M13="", O13="", N13<>""), "○", "")'
 FORMULA_VALUE_COMPARE = '=IF(P13="","",IF(P13="←",IF(OFFSET($J13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)="","",OFFSET($L13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)),P13))'
 FORMULA_VALUE_PROCESS = '=IF(COUNTIF(Q13,"*(*"),MID(Q13,FIND("(",Q13,1)+1,FIND(")",Q13,1)-FIND("(",Q13,1)-1),IF(COUNTIF(Q13,"*""*"),MID(Q13,FIND("""",Q13,1)+1,LEN(Q13)-2),IF(COUNTIF(Q13,"*：*"),RIGHT(Q13,LEN(Q13)-(FIND("：",Q13))),Q13)))'
-FORMULA_VLOOKUP = '=IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))),"NA"))'
+FORMULA_VLOOKUP = '=IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13)&".1",dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13)&".1",dump!$A:$A,0))),"NA")))'
 FORMULA_HANTEI = '=IF($K13<>"",IF($E13<>"","■",""),IF(AND(R13="",S13="NA"),"●", IF(EXACT(R13,S13),"●","×")))'
 
 def _normalize_oid_for_lookup(oid_value):

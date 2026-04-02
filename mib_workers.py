@@ -427,7 +427,7 @@ def background_worker_mode2(spek_path, checksheet_path, selected_model, output_q
         
         # Save file
         file_name, file_ext = os.path.splitext(checksheet_path)
-        new_path_check = f"{file_name}_{selected_model}_aftergenerate{file_ext}"
+        new_path_check = f"{file_name}_{selected_model}{file_ext}"
         
         file_format = 52 if file_ext.lower() == '.xlsm' else 51
         
