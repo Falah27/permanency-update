@@ -78,7 +78,7 @@ EVAL_HEADERS = ["値(比較用)", "値(比較用） 加工", "取得値", "自�
 FORMULA_SHOURYAKU = '=IF(AND(M13="", O13="", N13<>""), "○", "")'
 FORMULA_VALUE_COMPARE = '=IF(P13="","",IF(P13="←",IF(OFFSET($J13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)="","",OFFSET($L13,0,MATCH(MID(M13,1,FIND("の",M13,1)-1), $L$11:$BA$11,0)+4,1,1)),P13))'
 FORMULA_VALUE_PROCESS = '=IF(COUNTIF(Q13,"*(*"),MID(Q13,FIND("(",Q13,1)+1,FIND(")",Q13,1)-FIND("(",Q13,1)-1),IF(COUNTIF(Q13,"*""*"),MID(Q13,FIND("""",Q13,1)+1,LEN(Q13)-2),IF(COUNTIF(Q13,"*：*"),RIGHT(Q13,LEN(Q13)-(FIND("：",Q13))),Q13)))'
-FORMULA_VLOOKUP = '=IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13)&".1",dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13)&".1",dump!$A:$A,0))),"NA")))'
+FORMULA_VLOOKUP = '=IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1"),dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13)&".1",dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13)&".1",dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(TRIM($F13)&".*",dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(TRIM($F13)&".*",dump!$A:$A,0))),IFERROR(IF(INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1")&".*",dump!$A:$A,0))="","空文字",INDEX(dump!$D:$D,MATCH(SUBSTITUTE(SUBSTITUTE(TRIM($F13),".x",".1"),".X",".1")&".*",dump!$A:$A,0))),"NA")))))'
 FORMULA_HANTEI = '=IF($K13<>"",IF($E13<>"","■",""),IF(AND(R13="",S13="NA"),"●", IF(EXACT(R13,S13),"●","×")))'
 
 def _normalize_oid_for_lookup(oid_value):
@@ -741,6 +741,232 @@ def detect_models_from_spek(file_spek, checksheet_filename=""):
             pass
     
     return models
+
+
+# ==========================================
+# MODE 2 MATCHING HELPERS (PURE LOGIC)
+# ==========================================
+
+def normalize_excel_range_2d(range_value):
+    """Normalize Excel COM range result to list of row tuples."""
+    if range_value is None:
+        return []
+
+    if isinstance(range_value, tuple):
+        if len(range_value) == 0:
+            return []
+        if isinstance(range_value[0], tuple):
+            return list(range_value)
+        return [(range_value,)]
+
+    return [(range_value,)]
+
+
+def _normalize_oid_for_match(oid_value):
+    """Normalize OID for strict matching by converting segment '.x' to '.1'."""
+    oid = str(oid_value).strip() if oid_value is not None else ""
+    if not oid:
+        return ""
+    return re.sub(r'\.[xX](?=\.|$)', '.1', oid)
+
+
+def _get_first_cell(rows, index):
+    """Read first-cell value from normalized range rows."""
+    if index < 0 or index >= len(rows):
+        return None
+    row = rows[index]
+    if not row:
+        return None
+    return row[0]
+
+
+def build_mode2_lookup_maps(oid_rows, attr_rows, value_rows):
+    """Build lookup maps for Mode 2 matching from normalized row data."""
+    private_oid_value_map = {}
+    private_attr_value_map = {}
+    mib_oid_to_attr_map = {}
+    parent_oid_index = {}
+
+    total = max(len(oid_rows), len(attr_rows), len(value_rows))
+
+    for i in range(total):
+        oid = _get_first_cell(oid_rows, i)
+        attr_name = _get_first_cell(attr_rows, i)
+        value = _get_first_cell(value_rows, i)
+
+        if oid:
+            oid_key = _normalize_oid_for_match(oid)
+            private_oid_value_map[oid_key] = value if value else ""
+
+            oid_parts = oid_key.split('.')
+            for length in range(len(oid_parts), 0, -1):
+                prefix = '.'.join(oid_parts[:length])
+                if prefix not in parent_oid_index:
+                    parent_oid_index[prefix] = []
+                if oid_key not in parent_oid_index[prefix]:
+                    parent_oid_index[prefix].append(oid_key)
+
+            if attr_name:
+                mib_oid_to_attr_map[oid_key] = str(attr_name).strip().lower()
+
+        if attr_name:
+            attr_key = str(attr_name).strip().lower()
+            if value is not None and str(value).strip() != "":
+                private_attr_value_map[attr_key] = value
+
+    return {
+        "private_oid_value_map": private_oid_value_map,
+        "private_attr_value_map": private_attr_value_map,
+        "mib_oid_to_attr_map": mib_oid_to_attr_map,
+        "parent_oid_index": parent_oid_index,
+        "mib_oids_set": set(private_oid_value_map.keys()),
+    }
+
+
+def process_mode2_matching_rows(
+    check_oid_rows,
+    check_attr_rows,
+    check_col_e_rows,
+    private_oid_value_map,
+    private_attr_value_map,
+    mib_oid_to_attr_map,
+    parent_oid_index,
+    mib_oids_set,
+    progress_callback=None,
+):
+    """Run Mode 2 matching and build output columns plus stats."""
+    output_data_col_i = []
+    output_data_col_j = []
+    output_data_rest = []
+
+    match_count = 0
+    no_support_count = 0
+
+    value_from_exact_oid = 0
+    value_from_parent_oid = 0
+    value_from_attr = 0
+    value_empty = 0
+
+    total_rows = len(check_oid_rows)
+
+    for idx, row in enumerate(check_oid_rows, start=1):
+        c_oid_raw = row[0] if row else None
+
+        c_attr_name = ""
+        attr_row = check_attr_rows[idx - 1] if idx <= len(check_attr_rows) else None
+        if attr_row and attr_row[0]:
+            c_attr_name = str(attr_row[0]).strip().lower()
+
+        col_e_value = ""
+        col_e_row = check_col_e_rows[idx - 1] if idx <= len(check_col_e_rows) else None
+        if col_e_row and col_e_row[0]:
+            col_e_value = str(col_e_row[0]).strip()
+
+        if not c_oid_raw:
+            output_data_col_i.append("")
+            output_data_col_j.append("")
+            output_data_rest.append([""] * 13)
+            continue
+
+        c_oid = _normalize_oid_for_match(c_oid_raw)
+
+        if "範囲外" in col_e_value:
+            is_match = False
+        else:
+            is_match = False
+
+            if c_oid in mib_oids_set:
+                if c_oid in mib_oid_to_attr_map:
+                    if c_attr_name == mib_oid_to_attr_map[c_oid]:
+                        is_match = True
+                else:
+                    is_match = True
+
+            if not is_match:
+                c_oid_parts = c_oid.split('.')
+                for length in range(len(c_oid_parts) - 1, 0, -1):
+                    parent_prefix = '.'.join(c_oid_parts[:length])
+                    if parent_prefix not in parent_oid_index:
+                        continue
+
+                    for m_oid in parent_oid_index[parent_prefix]:
+                        if c_oid.startswith(m_oid + ".") or c_oid == m_oid:
+                            if m_oid in mib_oid_to_attr_map:
+                                if c_attr_name == mib_oid_to_attr_map[m_oid]:
+                                    is_match = True
+                                    break
+                            else:
+                                is_match = True
+                                break
+
+                    if is_match:
+                        break
+
+            if not is_match and c_attr_name and c_attr_name in private_attr_value_map:
+                is_match = True
+
+        model_value = ""
+
+        if is_match:
+            if c_oid in private_oid_value_map:
+                model_value = private_oid_value_map[c_oid]
+                if model_value and str(model_value).strip() != "":
+                    value_from_exact_oid += 1
+            else:
+                c_oid_parts = c_oid.split('.')
+                best_match_value = None
+
+                for length in range(len(c_oid_parts), 0, -1):
+                    prefix = '.'.join(c_oid_parts[:length])
+                    if prefix in private_oid_value_map:
+                        best_match_value = private_oid_value_map[prefix]
+                        break
+
+                if best_match_value is not None:
+                    model_value = best_match_value
+                    if model_value and str(model_value).strip() != "":
+                        value_from_parent_oid += 1
+                elif c_attr_name and c_attr_name in private_attr_value_map:
+                    model_value = private_attr_value_map[c_attr_name]
+                    if model_value and str(model_value).strip() != "":
+                        value_from_attr += 1
+
+            if model_value is None or str(model_value).strip() == "":
+                model_value = ""
+                value_empty += 1
+            else:
+                model_value = extract_numeric_value(str(model_value).strip())
+
+        if is_match:
+            match_count += 1
+            output_data_col_i.append("FactoryDefault")
+            output_data_col_j.append(model_value if model_value else "")
+            row_data = ["", "", "", "○", "", "", "", "○", "", "", "", "○", ""]
+        else:
+            no_support_count += 1
+            output_data_col_i.append("NoSupport")
+            output_data_col_j.append("")
+            row_data = ["[NA]", "", "", "-", "[NA]", "", "", "-", "[NA]", "", "", "-", ""]
+
+        output_data_rest.append(row_data)
+
+        if progress_callback and idx % 100 == 0:
+            progress_callback(idx, total_rows)
+
+    return {
+        "output_data_col_i": output_data_col_i,
+        "output_data_col_j": output_data_col_j,
+        "output_data_rest": output_data_rest,
+        "stats": {
+            "match_count": match_count,
+            "no_support_count": no_support_count,
+            "total_rows": total_rows,
+            "value_from_exact_oid": value_from_exact_oid,
+            "value_from_parent_oid": value_from_parent_oid,
+            "value_from_attr": value_from_attr,
+            "value_empty": value_empty,
+        },
+    }
 
 # ==========================================
 # BACKGROUND WORKERS
